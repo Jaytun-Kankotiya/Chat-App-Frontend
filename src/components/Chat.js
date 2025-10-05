@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef } from "react";
 import { io } from "socket.io-client";
 import axios from "axios";
 import { Smile } from "lucide-react";
@@ -18,6 +18,16 @@ export const Chat = ({ user }) => {
   const typingTimeoutRef = useRef(null);
 
   const backendUrl = process.env.REACT_APP_SERVER_URL;
+  const inputRef = useRef(null)
+
+  useEffect(() => {
+    if (user?.username) {
+      socket.emit("join", user.username);
+      console.log(`${user.username} joined their room`);
+    }
+  }, [user?.username]);
+
+
   useEffect(() => {
     const fetchUsers = async () => {
       try {
@@ -30,11 +40,16 @@ export const Chat = ({ user }) => {
       }
     };
     fetchUsers();
-  }, [backendUrl]);
+  }, [backendUrl, user.username]);
 
   useEffect(() => {
-    socket.on("receive_message", (data) => {
-      setMessages((prev) => [...prev, data]);
+    const handleReceiveMessage = (data) => {
+      console.log("Received message:", data);
+
+      setMessages((prev) => {
+        if (!Array.isArray(prev)) return [data];
+        return [...prev, data];
+      });
 
       if (data.receiver === user.username) {
         socket.emit("mark_delivered", {
@@ -42,35 +57,78 @@ export const Chat = ({ user }) => {
           receiver: user.username,
         });
       }
-    });
+    };
 
-    socket.on("message_status", ({ messageId, status }) => {
-      setMessages((prev) =>
-        prev.map((msg) => (msg._id === messageId ? { ...msg, status } : msg))
-      );
-    });
-
-    socket.on("message_status_bulk", ({ sender: senderUser, status }) => {
-      setMessages((prev) =>
-        prev.map((msg) =>
-          msg.sender === senderUser && msg.receiver === user.username
-            ? { ...msg, status }
+    const handleMessageSentConfirmation = (data) => {
+      console.log("Message sent confirmation:", data);
+      setMessages((prev) => {
+        if (!Array.isArray(prev)) return [data];
+        return prev.map((msg) =>
+          msg._id?.toString().startsWith("temp-") &&
+          msg.sender === data.sender &&
+          msg.receiver === data.receiver &&
+          msg.message === data.message
+            ? data
             : msg
-        )
-      );
-    });
+        );
+      });
+    };
 
-    socket.on("typing_status", ({ sender, isTyping }) => {
+    const handleMessageStatus = ({ messageId, status }) => {
+      console.log("Message status update:", messageId, status);
+      setMessages((prev) => {
+        if (!Array.isArray(prev)) return [];
+        return prev.map((msg) =>
+          msg._id === messageId ? { ...msg, status } : msg
+        );
+      });
+    };
+
+    const handleMessageStatusBulk = ({ sender: senderUser, status }) => {
+      console.log("Bulk status update from:", senderUser, "status:", status);
+      setMessages((prev) => {
+        if (!Array.isArray(prev)) return [];
+        return prev.map((msg) => {
+          if (msg.sender === user.username && msg.receiver === senderUser) {
+            const statusOrder = { sending: 0, sent: 1, delivered: 2, seen: 3 };
+            const currentStatusLevel = statusOrder[msg.status] || 0;
+            const newStatusLevel = statusOrder[status] || 0;
+
+            if (newStatusLevel > currentStatusLevel) {
+              console.log(
+                `Updating message from ${msg.sender} to ${msg.receiver}: ${msg.status} -> ${status}`
+              );
+              return { ...msg, status };
+            }
+          }
+          return msg;
+        });
+      });
+    };
+
+    const handleTypingStatus = ({ sender, isTyping }) => {
+      console.log(
+        `Typing status received: ${sender} is ${
+          isTyping ? "typing" : "stopped typing"
+        }`
+      );
       setTypingUsers((prev) => ({ ...prev, [sender]: isTyping }));
-    });
+    };
+
+    socket.on("receive_message", handleReceiveMessage);
+    socket.on("message_sent_confirmation", handleMessageSentConfirmation);
+    socket.on("message_status", handleMessageStatus);
+    socket.on("message_status_bulk", handleMessageStatusBulk);
+    socket.on("typing_status", handleTypingStatus);
 
     return () => {
-      socket.off("receive_message");
-      socket.off("message_status");
-      socket.off("message_status_bulk");
-      socket.off("typing_status");
+      socket.off("receive_message", handleReceiveMessage);
+      socket.off("message_sent_confirmation", handleMessageSentConfirmation);
+      socket.off("message_status", handleMessageStatus);
+      socket.off("message_status_bulk", handleMessageStatusBulk);
+      socket.off("typing_status", handleTypingStatus);
     };
-  }, [user.username]);
+  }, [user.username, currentChat]);
 
   const fetchMessages = async (receiver) => {
     try {
@@ -98,12 +156,24 @@ export const Chat = ({ user }) => {
       message: currentMessage,
     };
 
-    setMessages((prev) => [...prev, { ...messageData, status: "sent" }]);
+    const tempMessage = {
+      ...messageData,
+      status: "sending",
+      createdAt: new Date().toISOString(),
+      _id: `temp-${Date.now()}`,
+    };
+
+    setMessages((prev) => [...prev, tempMessage]);
     setCurrentMessage("");
+    setShowEmojiPicker(false);
 
     socket.emit("send_message", messageData);
 
-    // fetchMessages(currentChat);
+    socket.emit("typing", {
+      sender: user.username,
+      receiver: currentChat,
+      isTyping: false,
+    });
   };
 
   useEffect(() => {
@@ -113,36 +183,50 @@ export const Chat = ({ user }) => {
         receiver: user.username,
       });
     }
-  }, [currentChat, user.username]);
+  }, [currentChat, user.username, messages]);
 
   const handleTyping = (e) => {
     const value = e.target.value;
     setCurrentMessage(value);
-    setCurrentMessage(e.target.value);
+
+    if (!currentChat) return;
+
     socket.emit("typing", {
       sender: user.username,
       receiver: currentChat,
-      isTyping: true,
+      isTyping: value.length > 0,
     });
 
-    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+    if (typingTimeoutRef.current) {
+      clearTimeout(typingTimeoutRef.current);
+    }
 
-    typingTimeoutRef.current = setTimeout(() => {
-      socket.emit("typing", {
-        sender: user.username,
-        receiver: currentChat,
-        isTyping: false,
-      });
-    }, 1000);
+    if (value.length > 0) {
+      typingTimeoutRef.current = setTimeout(() => {
+        socket.emit("typing", {
+          sender: user.username,
+          receiver: currentChat,
+          isTyping: false,
+        });
+      }, 2000);
+    }
   };
 
   const onEmojiClick = (emojiData, event) => {
     setCurrentMessage((prev) => prev + emojiData.emoji);
+    inputRef.current.focus()
+  };
+
+  const handleKeyPress = (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      sendMessage();
+    }
   };
 
   return (
     <div>
-      <h2>Welcome, {user.username}</h2>
+      <h2>Welcome, {user?.username}</h2>
       <div className="chat-container">
         <div className="chat-main">
           <div className="chat-list">
@@ -155,7 +239,7 @@ export const Chat = ({ user }) => {
                 onClick={() => fetchMessages(u.username)}>
                 {u.username}{" "}
                 {typingUsers[u.username] && (
-                  <span className="typing">typing...</span>
+                  <span className="typing">is typing...</span>
                 )}
               </div>
             ))}
@@ -164,7 +248,12 @@ export const Chat = ({ user }) => {
           <div className="chat-window">
             {currentChat && (
               <>
-                <h5>You are chatting with {currentChat}</h5>
+                <h5>
+                  You are chatting with {currentChat}
+                  {typingUsers[currentChat] && (
+                    <span className="typing-indicator"> (typing...)</span>
+                  )}
+                </h5>
                 <div className="message-list">
                   <MessageList messages={messages} user={user} />
                 </div>
@@ -175,7 +264,9 @@ export const Chat = ({ user }) => {
                       type="text"
                       placeholder="Type a message..."
                       value={currentMessage}
+                      ref={inputRef}
                       onChange={handleTyping}
+                      onKeyPress={handleKeyPress}
                     />
                     <button
                       type="button"

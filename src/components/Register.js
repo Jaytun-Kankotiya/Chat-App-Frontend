@@ -29,6 +29,13 @@ const Register = ({ setUser }) => {
     }
   };
 
+  const handleKeyPress = (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      handleRegister();
+    }
+  };
+
   return (
     <div className="card py-5 text-center">
       <div className="card-body px-5">
@@ -47,6 +54,7 @@ const Register = ({ setUser }) => {
           value={password}
           className="form-control form-control-lg mt-3"
           onChange={(e) => setPassword(e.target.value)}
+          onKeyPress={handleKeyPress}
         />
         <button
           className="btn btn-success btn-lg mt-3"
